@@ -30,3 +30,37 @@ If you are developing a production application, we recommend enabling type-aware
 ```
 
 See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+## Backend authentication API
+
+The backend exposes simple user authentication endpoints for the finance app. Set `MONGODB_URI` before starting the backend.
+
+### `POST /api/auth/register`
+
+Registers a new user and starts a session.
+
+```json
+{
+  "name": "Jane Doe",
+  "email": "jane@example.com",
+  "password": "secure-password"
+}
+```
+
+### `POST /api/auth/login`
+
+Logs in an existing user and returns a session token.
+
+```json
+{
+  "email": "jane@example.com",
+  "password": "secure-password"
+}
+```
+
+### `POST /api/auth/logout`
+
+Logs out the current session. Send the token in the `Authorization` header.
+
+```http
+Authorization: Bearer <token>
+```
