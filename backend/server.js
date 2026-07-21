@@ -7,9 +7,20 @@ const mongoose = require("mongoose");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const HOST = process.env.HOST || "0.0.0.0";
 const TOKEN_TTL_DAYS = 7;
+const RESET_TOKEN_TTL_MINUTES = 30;
 
-app.use(cors());
+const corsOrigins = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: corsOrigins.length > 0 ? corsOrigins : true,
+  })
+);
 app.use(express.json());
 
 const userSchema = new mongoose.Schema(
@@ -51,6 +62,8 @@ const userSchema = new mongoose.Schema(
         },
       },
     ],
+    resetPasswordTokenHash: String,
+    resetPasswordExpiresAt: Date,
   },
   { timestamps: true }
 );
@@ -97,6 +110,81 @@ function createSession(user) {
   return { token, expiresAt };
 }
 
+function createPasswordReset(user) {
+  const resetToken = crypto.randomBytes(32).toString("hex");
+
+  user.resetPasswordTokenHash = hashToken(resetToken);
+  user.resetPasswordExpiresAt = new Date(
+    Date.now() + RESET_TOKEN_TTL_MINUTES * 60 * 1000
+  );
+
+  return resetToken;
+}
+
+function isStrongPassword(password) {
+  return /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{10,}$/.test(
+    password
+  );
+}
+
+async function sendPasswordResetEmail(email, resetToken) {
+  const clientUrl =
+    process.env.FRONTEND_URL || process.env.CLIENT_URL || "http://127.0.0.1:5173";
+  const resetUrl = `${clientUrl}/reset-password?token=${resetToken}`;
+
+  if (process.env.RESEND_API_KEY && process.env.RESEND_FROM_EMAIL) {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: process.env.RESEND_FROM_EMAIL,
+        to: [email],
+        subject: "Reset your MoneySim password",
+        text: `Reset your MoneySim password here: ${resetUrl}`,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Resend returned ${response.status}`);
+    }
+
+    return { delivered: true };
+  }
+
+  if (!process.env.SENDGRID_API_KEY || !process.env.SENDGRID_FROM_EMAIL) {
+    console.log(`Password reset link for ${email}: ${resetUrl}`);
+    return { delivered: false, resetUrl };
+  }
+
+  const response = await fetch("https://api.sendgrid.com/v3/mail/send", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.SENDGRID_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      personalizations: [{ to: [{ email }] }],
+      from: { email: process.env.SENDGRID_FROM_EMAIL, name: "MoneySim" },
+      subject: "Reset your MoneySim password",
+      content: [
+        {
+          type: "text/plain",
+          value: `Reset your MoneySim password here: ${resetUrl}`,
+        },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`SendGrid returned ${response.status}`);
+  }
+
+  return { delivered: true };
+}
+
 function serializeUser(user) {
   return {
     id: user._id,
@@ -106,10 +194,14 @@ function serializeUser(user) {
   };
 }
 
-mongoose
-  .connect(process.env.MONGODB_URI)
-  .then(() => console.log("MongoDB connected"))
-  .catch((err) => console.error("MongoDB connection error:", err));
+function connectDatabase() {
+  const mongoUri = process.env.MONGO_URI || process.env.MONGODB_URI;
+
+  return mongoose
+    .connect(mongoUri)
+    .then(() => console.log("MongoDB connected"))
+    .catch((err) => console.error("MongoDB connection error:", err));
+}
 
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", database: mongoose.connection.readyState });
@@ -125,10 +217,11 @@ app.post("/api/auth/register", async (req, res) => {
       return res.status(400).json({ message: "A valid email is required." });
     }
 
-    if (password.length < 8) {
-      return res
-        .status(400)
-        .json({ message: "Password must be at least 8 characters long." });
+    if (!isStrongPassword(password)) {
+      return res.status(400).json({
+        message:
+          "Password must be at least 10 characters and include uppercase, lowercase, number, and symbol.",
+      });
     }
 
     const existingUser = await User.findOne({ email });
@@ -145,6 +238,82 @@ app.post("/api/auth/register", async (req, res) => {
   } catch (error) {
     console.error("Register error:", error);
     return res.status(500).json({ message: "Unable to register user." });
+  }
+});
+
+app.post("/api/auth/forgot-password", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ message: "A valid email is required." });
+    }
+
+    const user = await User.findOne({ email });
+    let mailResult;
+    if (user) {
+      const resetToken = createPasswordReset(user);
+      await user.save();
+      mailResult = await sendPasswordResetEmail(email, resetToken);
+    }
+
+    const payload = {
+      message:
+        "If that email is registered, a password reset link has been sent.",
+    };
+
+    if (process.env.NODE_ENV !== "production" && mailResult?.resetUrl) {
+      payload.resetUrl = mailResult.resetUrl;
+    }
+
+    return res.json(payload);
+  } catch (error) {
+    console.error("Forgot password error:", error);
+    return res
+      .status(500)
+      .json({ message: "Unable to start password recovery." });
+  }
+});
+
+app.post("/api/auth/reset-password", async (req, res) => {
+  try {
+    const token = String(req.body.token || "");
+    const password = String(req.body.password || "");
+
+    if (!token) {
+      return res.status(400).json({ message: "Reset token is required." });
+    }
+
+    if (!isStrongPassword(password)) {
+      return res.status(400).json({
+        message:
+          "Password must be at least 10 characters and include uppercase, lowercase, number, and symbol.",
+      });
+    }
+
+    const user = await User.findOne({
+      resetPasswordTokenHash: hashToken(token),
+      resetPasswordExpiresAt: { $gt: new Date() },
+    });
+
+    if (!user) {
+      return res
+        .status(400)
+        .json({ message: "Reset token is invalid or expired." });
+    }
+
+    const passwordFields = hashPassword(password);
+    user.passwordHash = passwordFields.passwordHash;
+    user.passwordSalt = passwordFields.passwordSalt;
+    user.resetPasswordTokenHash = undefined;
+    user.resetPasswordExpiresAt = undefined;
+    user.activeTokens = [];
+    await user.save();
+
+    return res.json({ message: "Password reset successfully." });
+  } catch (error) {
+    console.error("Reset password error:", error);
+    return res.status(500).json({ message: "Unable to reset password." });
   }
 });
 
@@ -195,6 +364,21 @@ app.post("/api/auth/logout", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+if (require.main === module) {
+  connectDatabase().finally(() => {
+    app.listen(PORT, HOST, () => {
+      console.log(`Server running on ${HOST}:${PORT}`);
+    });
+  });
+}
+
+module.exports = {
+  app,
+  connectDatabase,
+  createPasswordReset,
+  hashPassword,
+  hashToken,
+  isStrongPassword,
+  normalizeEmail,
+  verifyPassword,
+};
